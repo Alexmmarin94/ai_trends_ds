@@ -1,0 +1,34 @@
+# === Core data science, ML, and embedding libraries ===
+pandas==2.3.1            # DataFrame support, used throughout the pipeline
+numpy==2.2.6             # Numeric processing
+scikit-learn==1.7.0      # KMeans, silhouette_score, deduplication, and utilities
+sentence-transformers==5.0.0  # Text embedding model for job clustering
+umap-learn==0.5.9.post2  # UMAP for 2D visualization in cluster explorer
+hdbscan==0.8.40          # Sometimes required as a dependency for umap-learn
+
+# === Web/API/Cloud support ===
+requests==2.32.4         # For API calls (job fetcher)
+python-dotenv==1.1.1     # For loading API keys from .env files
+toml==0.10.2             # For reading secrets.toml in some environments
+tqdm==4.67.1             # Progress bars, used in job fetching and embedding
+
+# === Visualization ===
+plotly==6.2.0            # All Streamlit charts use Plotly
+streamlit==1.47.0        # Core web app framework
+
+# === LLM and LangChain ecosystem ===
+openai==1.95.1                   # For OpenRouter and OpenAI integration
+langchain-core==0.3.69
+langchain-openai==0.3.27
+langchain==0.3.26
+langchain-community==0.3.27
+langchain-chroma==0.2.4
+langchain-huggingface==0.3.0
+langchain-text-splitters==0.3.8
+
+# === Data modeling ===
+pydantic==2.11.7          # Used for structured outputs in LLM wrappers
+
+# === Notebook parsing and misc (used by embeddings & some transformers utils) ===
+nbformat==5.10.4          # Sometimes required by sentence-transformers or embedding pipelines
+joblib==1.5.1             # Used by scikit-learn and sentence-transformers for parallelization
