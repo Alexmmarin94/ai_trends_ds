@@ -2,9 +2,8 @@ name: Monthly or Manual Dataset Update
 
 on:
   schedule:
-    # Runs at 00:00 UTC on the 28th of every month
     - cron: '0 0 28 * *'
-  workflow_dispatch:   # Allows manual execution from the GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
   run-generate-datasets:
@@ -13,13 +12,17 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Print env vars for debug
-        run: env | grep -E 'OPENROUTER|JSEARCH|LLM'
+      - name: Set environment variables
+        run: |
+          echo "OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}" >> $GITHUB_ENV
+          echo "OPENROUTER_BASE_URL=${{ secrets.OPENROUTER_BASE_URL }}" >> $GITHUB_ENV
+          echo "LLM_MODEL=${{ secrets.LLM_MODEL }}" >> $GITHUB_ENV
+          echo "JSEARCH_API_KEY=${{ secrets.JSEARCH_API_KEY }}" >> $GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'  # Compatible with all your libraries
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -28,3 +31,4 @@ jobs:
 
       - name: Run monthly update script
         run: python utils/generate_all_datasets.py
+
