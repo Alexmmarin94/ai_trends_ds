@@ -16,6 +16,12 @@ OUTPUT_PATH = Path("data/job_postings_cleaned/data_scientist_us.csv")
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def get_api_key():
+    # 1. Check environment variable first (GitHub Actions, Streamlit Cloud, or local export)
+    key = os.getenv("JSEARCH_API_KEY")
+    if key:
+        return key
+
+    # 2. If not found, try .env or .streamlit/secrets.toml for local dev/Streamlit Cloud
     paths = [
         ".env",
         ".streamlit/secrets.toml",
@@ -30,13 +36,17 @@ def get_api_key():
                     return key
             else:
                 secrets = toml.load(path)
-                return secrets["JSEARCH_API_KEY"]
+                if "JSEARCH_API_KEY" in secrets:
+                    return secrets["JSEARCH_API_KEY"]
+
+    # 3. If still not found, raise error
     raise RuntimeError("JSEARCH_API_KEY not found")
 
-headers = {
-    "X-RapidAPI-Key": get_api_key(),
-    "X-RapidAPI-Host": API_HOST
-}
+def get_headers():
+    return {
+        "X-RapidAPI-Key": get_api_key(),
+        "X-RapidAPI-Host": API_HOST
+    }
 
 job_queries = [
     "data scientist in US",
@@ -55,6 +65,7 @@ job_queries = [
 
 def fetch_us_jobs(queries, max_pages=50, delay_seconds=1.5):
     all_jobs = []
+    headers = get_headers()
     for query in queries:
         for page in range(1, max_pages + 1):
             params = {"query": query, "page": page, "country": "us", "language": "en"}
