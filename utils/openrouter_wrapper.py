@@ -15,18 +15,23 @@ def get_env_var(key: str):
     """
     Returns the value of an environment variable or Streamlit secret.
     Priority:
-    1. Streamlit secrets (if running in Streamlit and key exists)
-    2. os.environ (from .env or system)
+    1. Streamlit secrets (if running in Streamlit and secrets are loaded)
+    2. os.environ (from .env, GitHub Actions, or system)
     """
-    if has_streamlit_secrets and key in st.secrets:
-        print(f"[INFO] Retrieved secret: {key}")
-        return st.secrets[key]
+    if has_streamlit_secrets:
+        try:
+            # Only use st.secrets if not empty
+            if hasattr(st, "secrets") and st.secrets and key in st.secrets:
+                print(f"[INFO] Retrieved secret: {key} from Streamlit secrets")
+                return st.secrets[key]
+        except Exception:
+            # Ignore if secrets are not loaded
+            pass
 
     value = os.getenv(key)
     if value:
         print(f"[INFO] Retrieved env var: {key}")
     return value
-
 
 # Retrieve config values
 api_key = get_env_var("OPENROUTER_API_KEY")
