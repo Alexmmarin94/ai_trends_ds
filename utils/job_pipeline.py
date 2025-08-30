@@ -1,5 +1,6 @@
 import os
 import time
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -47,20 +48,18 @@ def run_job_pipeline():
 
     df_old = _ensure_columns(df_old, EXPECTED_BASE_COLS)
 
-    # --- Fetch
+    # --- Fetch new
     print("🌐 Fetching new jobs from API...")
     try:
         df_new_raw = fetch_us_jobs(job_queries)
-        # Defensive: normalize expected columns and index
         if not df_new_raw.empty:
             df_new_raw = df_new_raw.reset_index(drop=True)
     except Exception as e:
         print(f"❌ Failed to fetch jobs from API: {e}")
         df_new_raw = pd.DataFrame()
 
-    # --- Deduplicate vs historical by job_id and near-duplicate text
+    # --- Dedup vs base and near-duplicate by text
     if not df_new_raw.empty:
-        # Strict de-dup by job_id against df_old
         already_ids = set(df_old["job_id"].dropna()) if not df_old.empty else set()
         mask_unseen = ~df_new_raw["job_id"].isin(already_ids)
         df_new = df_new_raw.loc[mask_unseen].copy().reset_index(drop=True)
@@ -71,45 +70,49 @@ def run_job_pipeline():
                 df_new["job_title"].fillna("") + " " + df_new["job_description"].fillna("")
             )
 
-            # Reset index so cosine matrix positions match DataFrame positions
-            df_new = df_new.reset_index(drop=True)
+            # Optional switch to disable TF-IDF dedupe via env var
+            dedupe_disabled = os.getenv("JOB_DEDUPE_DISABLE", "0") == "1"
 
-            # Near-duplicate dedupe by cosine similarity (TF-IDF)
-            try:
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.metrics.pairwise import cosine_similarity
+            if not dedupe_disabled:
+                try:
+                    # Reset positional index so matrix positions == row positions
+                    df_new = df_new.reset_index(drop=True)
 
-                tfidf = TfidfVectorizer(stop_words="english")
-                tfidf_matrix = tfidf.fit_transform(df_new["job_title_description"])
-                cos_sim_matrix = cosine_similarity(tfidf_matrix)
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+                    from sklearn.metrics.pairwise import cosine_similarity
 
-                to_drop_pos = set()
-                n = len(df_new)
-                # Triangular loop to avoid double work; threshold 0.90 as in your version
-                for i in range(n):
-                    if i in to_drop_pos:
-                        continue
-                    sims = cos_sim_matrix[i, i + 1 :]
-                    for offset, s in enumerate(sims, start=1):
-                        j = i + offset
-                        if s >= 0.90:
-                            to_drop_pos.add(j)
+                    tfidf = TfidfVectorizer(stop_words="english")
+                    tfidf_matrix = tfidf.fit_transform(df_new["job_title_description"])
+                    cos_sim_matrix = cosine_similarity(tfidf_matrix)
 
-                if to_drop_pos:
-                    # Drop by positions safely
-                    idx_to_drop = sorted(to_drop_pos)
-                    df_new = df_new.drop(index=idx_to_drop, errors="ignore").reset_index(drop=True)
+                    # Build set of positions to drop
+                    to_drop_pos = set()
+                    n = len(df_new)
+                    for i in range(n):
+                        if i in to_drop_pos:
+                            continue
+                        sims = cos_sim_matrix[i, i + 1 :]
+                        for offset, s in enumerate(sims, start=1):
+                            j = i + offset
+                            if s >= 0.90:
+                                to_drop_pos.add(j)
 
-            except Exception as e:
-                print(f"⚠️ Text-dedupe step skipped due to error: {e}")
+                    # Drop by POSITION (iloc), never by label
+                    if to_drop_pos:
+                        keep = np.ones(n, dtype=bool)
+                        keep[list(to_drop_pos)] = False
+                        df_new = df_new.iloc[keep].reset_index(drop=True)
 
-            # Keep extraction_date coming from fetcher if present; otherwise set now
+                except Exception as e:
+                    print(f"⚠️ Text-dedupe step skipped due to error: {e}")
+
+            # Keep or set extraction_date
             if "extraction_date" not in df_new.columns or df_new["extraction_date"].isnull().all():
                 df_new["extraction_date"] = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-            # Append to base (drop helper col)
-            df_new = df_new.drop(columns=["job_title_description"], errors="ignore")
+            # Append to base
             before = len(df_old)
+            df_new = df_new.drop(columns=["job_title_description"], errors="ignore")
             df_old = pd.concat([df_old, df_new], ignore_index=True)
             added = len(df_old) - before
             print(f"✅ Appended {added} new jobs to base.")
@@ -124,7 +127,6 @@ def run_job_pipeline():
     else:
         df_classified = pd.DataFrame(columns=["job_id", "is_valid_job"])
 
-    # Choose jobs missing classification (not present in file or null in base)
     already_classified_ids = set(df_classified["job_id"]) if not df_classified.empty else set()
     need_cls_mask = (~df_old["job_id"].isin(already_classified_ids)) | (df_old["is_valid_job"].isnull())
     to_classify = df_old.loc[need_cls_mask].copy()
@@ -140,10 +142,10 @@ def run_job_pipeline():
                 print(f"❌ Error classifying job {row['job_id']}: {e}")
 
         if new_classified:
-            df_classified = pd.concat(
-                [df_classified, pd.DataFrame(new_classified)],
-                ignore_index=True
-            ).drop_duplicates("job_id", keep="last")
+            df_classified = (
+                pd.concat([df_classified, pd.DataFrame(new_classified)], ignore_index=True)
+                .drop_duplicates("job_id", keep="last")
+            )
             df_classified.to_csv(CLASSIFIED_PATH, index=False)
             print("✅ Classification completed and saved.")
         else:
@@ -185,8 +187,10 @@ def run_job_pipeline():
                 print(f"❌ Error enriching job {row['job_id']}: {e}")
 
         if new_enriched:
-            df_ai = pd.concat([df_ai, pd.DataFrame(new_enriched)], ignore_index=True)\
-                     .drop_duplicates("job_id", keep="last")
+            df_ai = (
+                pd.concat([df_ai, pd.DataFrame(new_enriched)], ignore_index=True)
+                .drop_duplicates("job_id", keep="last")
+            )
             df_ai.to_csv(AI_ENRICHED_PATH, index=False)
             print("✅ AI & Data enrichment completed and saved.")
         else:
