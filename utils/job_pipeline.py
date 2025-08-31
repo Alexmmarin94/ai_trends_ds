@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -38,12 +39,30 @@ EXPECTED_FETCH_COLS = [
     "extraction_date",
 ]
 
+# Columns que deben quedar como TEXTO siempre
+TEXT_COLS = ["ai_mentions", "ai_details", "data_mentions", "data_details"]
+
+
+def _to_text(x):
+    """Normaliza listas/dicts/NaNs a string seguro."""
+    if isinstance(x, list):
+        # Une listas en una cadena legible
+        return " ".join(map(str, x))
+    if isinstance(x, dict):
+        # Serializa dict a JSON
+        return json.dumps(x, ensure_ascii=False)
+    if pd.isna(x):
+        return ""
+    return str(x)
+
+
 def _ensure_columns(df: pd.DataFrame, cols) -> pd.DataFrame:
-    """Ensure columns exist; create as None if missing."""
+    """Asegura columnas; crea como None si faltan."""
     for c in cols:
         if c not in df.columns:
             df[c] = None
     return df
+
 
 def run_job_pipeline():
     print("🚀 Starting job pipeline...")
@@ -69,9 +88,9 @@ def run_job_pipeline():
         print(f"❌ Failed to fetch jobs from API: {e}")
         df_new_raw = pd.DataFrame(columns=EXPECTED_FETCH_COLS)
 
-    # --- Deduplicate vs historical by job_id + near-duplicate by text (robust positional drop)
+    # --- Deduplicate vs historical by job_id + near-duplicate by text (positional-safe)
     if not df_new_raw.empty:
-        # Drop duplicates within the fetched batch by job_id first
+        # Dedupe interno por job_id
         df_new_raw = df_new_raw.drop_duplicates(subset=["job_id"], keep="last").reset_index(drop=True)
 
         already_ids = set(df_old["job_id"].dropna()) if not df_old.empty else set()
@@ -79,15 +98,11 @@ def run_job_pipeline():
         df_new = df_new_raw.loc[mask_unseen].copy().reset_index(drop=True)
 
         if not df_new.empty:
-            # Build helper text for TF-IDF dedupe
+            # Texto auxiliar para dedupe por similitud
             df_new["job_title_description"] = (
                 df_new["job_title"].fillna("") + " " + df_new["job_description"].fillna("")
             )
 
-            # Ensure positional index 0..n-1 before any positional ops
-            df_new = df_new.reset_index(drop=True)
-
-            # Near-duplicate dedupe (positional-safe). If it fails, skip without crashing.
             try:
                 from sklearn.feature_extraction.text import TfidfVectorizer
                 from sklearn.metrics.pairwise import cosine_similarity
@@ -98,7 +113,6 @@ def run_job_pipeline():
 
                 to_drop_pos = set()
                 n = len(df_new)
-                # Triangular scan; threshold 0.90 as your original logic
                 for i in range(n):
                     if i in to_drop_pos:
                         continue
@@ -117,11 +131,10 @@ def run_job_pipeline():
             except Exception as e:
                 print(f"⚠️ Skipping text dedup due to error: {e}")
 
-            # Ensure extraction_date exists (fetcher should set it; fallback to today)
+            # Asegura extraction_date
             if "extraction_date" not in df_new.columns or df_new["extraction_date"].isnull().all():
                 df_new["extraction_date"] = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-            # Append new rows into base, drop helper col
             before = len(df_old)
             df_new = df_new.drop(columns=["job_title_description"], errors="ignore")
             df_old = pd.concat([df_old, df_new], ignore_index=True)
@@ -172,6 +185,11 @@ def run_job_pipeline():
     # --- AI/Data enrichment
     if AI_ENRICHED_PATH.exists():
         df_ai = pd.read_csv(AI_ENRICHED_PATH, low_memory=False)
+        # Normaliza por si el CSV previo trae listas serializadas / objetos
+        if not df_ai.empty:
+            for c in TEXT_COLS:
+                if c in df_ai.columns:
+                    df_ai[c] = df_ai[c].apply(_to_text)
     else:
         df_ai = pd.DataFrame(columns=["job_id", "ai_mentions", "ai_details", "data_mentions", "data_details"])
 
@@ -202,6 +220,11 @@ def run_job_pipeline():
                 pd.concat([df_ai, pd.DataFrame(new_enriched)], ignore_index=True)
                 .drop_duplicates("job_id", keep="last")
             )
+            # 🔒 Normaliza SIEMPRE a texto antes de guardar/mergear
+            for c in TEXT_COLS:
+                if c in df_ai.columns:
+                    df_ai[c] = df_ai[c].apply(_to_text)
+
             df_ai.to_csv(AI_ENRICHED_PATH, index=False)
             print("✅ AI & Data enrichment completed and saved.")
         else:
@@ -214,6 +237,11 @@ def run_job_pipeline():
         columns=["ai_mentions", "ai_details", "data_mentions", "data_details"],
         errors="ignore"
     ).merge(df_ai, on="job_id", how="left")
+
+    # 🔒 Normaliza también en df_old para garantizar strings
+    for c in TEXT_COLS:
+        if c in df_old.columns:
+            df_old[c] = df_old[c].apply(_to_text)
 
     # --- Save final
     df_old.to_csv(OUTPUT_PATH, index=False)
