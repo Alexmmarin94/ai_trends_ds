@@ -1,5 +1,4 @@
 import os
-import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -13,6 +12,7 @@ OUTPUT_PATH = Path("data/job_postings_cleaned/data_scientist_us.csv")
 CLASSIFIED_PATH = Path("data/job_postings_cleaned/data_scientist_us_classified.csv")
 AI_ENRICHED_PATH = Path("data/job_postings_cleaned/data_scientist_us_ai_enriched.csv")
 
+# Expected schemas
 EXPECTED_BASE_COLS = [
     "job_id",
     "job_title",
@@ -28,7 +28,17 @@ EXPECTED_BASE_COLS = [
     "data_details",
 ]
 
-def _ensure_columns(df: pd.DataFrame, cols):
+EXPECTED_FETCH_COLS = [
+    "job_id",
+    "job_title",
+    "job_description",
+    "job_posted_at_datetime_utc",
+    "job_highlights.Qualifications",
+    "job_highlights.Responsibilities",
+    "extraction_date",
+]
+
+def _ensure_columns(df: pd.DataFrame, cols) -> pd.DataFrame:
     """Ensure columns exist; create as None if missing."""
     for c in cols:
         if c not in df.columns:
@@ -48,69 +58,70 @@ def run_job_pipeline():
 
     df_old = _ensure_columns(df_old, EXPECTED_BASE_COLS)
 
-    # --- Fetch new
+    # --- Fetch new jobs
     print("🌐 Fetching new jobs from API...")
     try:
         df_new_raw = fetch_us_jobs(job_queries)
         if not df_new_raw.empty:
             df_new_raw = df_new_raw.reset_index(drop=True)
+            df_new_raw = _ensure_columns(df_new_raw, EXPECTED_FETCH_COLS)
     except Exception as e:
         print(f"❌ Failed to fetch jobs from API: {e}")
-        df_new_raw = pd.DataFrame()
+        df_new_raw = pd.DataFrame(columns=EXPECTED_FETCH_COLS)
 
-    # --- Dedup vs base and near-duplicate by text
+    # --- Deduplicate vs historical by job_id + near-duplicate by text (robust positional drop)
     if not df_new_raw.empty:
+        # Drop duplicates within the fetched batch by job_id first
+        df_new_raw = df_new_raw.drop_duplicates(subset=["job_id"], keep="last").reset_index(drop=True)
+
         already_ids = set(df_old["job_id"].dropna()) if not df_old.empty else set()
         mask_unseen = ~df_new_raw["job_id"].isin(already_ids)
         df_new = df_new_raw.loc[mask_unseen].copy().reset_index(drop=True)
 
         if not df_new.empty:
-            # Build helper text
+            # Build helper text for TF-IDF dedupe
             df_new["job_title_description"] = (
                 df_new["job_title"].fillna("") + " " + df_new["job_description"].fillna("")
             )
 
-            # Optional switch to disable TF-IDF dedupe via env var
-            dedupe_disabled = os.getenv("JOB_DEDUPE_DISABLE", "0") == "1"
+            # Ensure positional index 0..n-1 before any positional ops
+            df_new = df_new.reset_index(drop=True)
 
-            if not dedupe_disabled:
-                try:
-                    # Reset positional index so matrix positions == row positions
-                    df_new = df_new.reset_index(drop=True)
+            # Near-duplicate dedupe (positional-safe). If it fails, skip without crashing.
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.metrics.pairwise import cosine_similarity
 
-                    from sklearn.feature_extraction.text import TfidfVectorizer
-                    from sklearn.metrics.pairwise import cosine_similarity
+                tfidf = TfidfVectorizer(stop_words="english")
+                tfidf_matrix = tfidf.fit_transform(df_new["job_title_description"])
+                cos_sim_matrix = cosine_similarity(tfidf_matrix)
 
-                    tfidf = TfidfVectorizer(stop_words="english")
-                    tfidf_matrix = tfidf.fit_transform(df_new["job_title_description"])
-                    cos_sim_matrix = cosine_similarity(tfidf_matrix)
+                to_drop_pos = set()
+                n = len(df_new)
+                # Triangular scan; threshold 0.90 as your original logic
+                for i in range(n):
+                    if i in to_drop_pos:
+                        continue
+                    sims = cos_sim_matrix[i, i + 1 :]
+                    for offset, s in enumerate(sims, start=1):
+                        j = i + offset
+                        if s >= 0.90:
+                            to_drop_pos.add(j)
 
-                    # Build set of positions to drop
-                    to_drop_pos = set()
-                    n = len(df_new)
-                    for i in range(n):
-                        if i in to_drop_pos:
-                            continue
-                        sims = cos_sim_matrix[i, i + 1 :]
-                        for offset, s in enumerate(sims, start=1):
-                            j = i + offset
-                            if s >= 0.90:
-                                to_drop_pos.add(j)
+                if to_drop_pos:
+                    keep_mask = np.ones(n, dtype=bool)
+                    idx_to_drop = [p for p in to_drop_pos if 0 <= p < n]
+                    keep_mask[idx_to_drop] = False
+                    df_new = df_new.iloc[keep_mask].reset_index(drop=True)
 
-                    # Drop by POSITION (iloc), never by label
-                    if to_drop_pos:
-                        keep = np.ones(n, dtype=bool)
-                        keep[list(to_drop_pos)] = False
-                        df_new = df_new.iloc[keep].reset_index(drop=True)
+            except Exception as e:
+                print(f"⚠️ Skipping text dedup due to error: {e}")
 
-                except Exception as e:
-                    print(f"⚠️ Text-dedupe step skipped due to error: {e}")
-
-            # Keep or set extraction_date
+            # Ensure extraction_date exists (fetcher should set it; fallback to today)
             if "extraction_date" not in df_new.columns or df_new["extraction_date"].isnull().all():
                 df_new["extraction_date"] = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-            # Append to base
+            # Append new rows into base, drop helper col
             before = len(df_old)
             df_new = df_new.drop(columns=["job_title_description"], errors="ignore")
             df_old = pd.concat([df_old, df_new], ignore_index=True)
